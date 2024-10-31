@@ -1,47 +1,60 @@
-{{- if and $.Values.server.enabled (eq $.Values.server.mode "cluster")}}
-{{- range $service := (list "frontend" "history" "matching" "worker") }}
-{{ $serviceValues := index $.Values.server $service }}
+{{- if and $.Values.server.enabled (eq $.Values.server.mode "standalone")}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "temporal.componentname" (list $ $service) }}
-  annotations:
-    {{- include "temporal.resourceAnnotations" (list $ $service "deployment") | nindent 4 }}
+  name: {{ include "temporal.componentname" (list . "server") }}
   labels:
-    {{- include "temporal.resourceLabels" (list $ $service "deployment") | nindent 4 }}
+    app.kubernetes.io/name: {{ include "temporal.name" $ }}
+    helm.sh/chart: {{ include "temporal.chart" $ }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/version: {{ $.Chart.AppVersion | replace "+" "_" }}
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: {{ $.Chart.Name }}
 spec:
-  replicas: {{ default $.Values.server.replicaCount $serviceValues.replicaCount }}
+  replicas: {{ $.Values.server.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "temporal.name" $ }}
       app.kubernetes.io/instance: {{ $.Release.Name }}
-      app.kubernetes.io/component: {{ $service }}
+      app.kubernetes.io/component: server
   template:
     metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "temporal.name" $ }}
+        helm.sh/chart: {{ include "temporal.chart" $ }}
+        app.kubernetes.io/managed-by: {{ $.Release.Service }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/version: {{ $.Chart.AppVersion | replace "+" "_" }}
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: {{ $.Chart.Name }}
+        {{- with $.Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/server-configmap.yaml") $ | sha256sum }}
-        {{- if (default $.Values.server.metrics.annotations.enabled $serviceValues.metrics.annotations.enabled) }}
-        prometheus.io/job: {{ $.Chart.Name }}-{{ $service }}
+        {{- if $.Values.server.metrics.annotations.enabled }}
+        prometheus.io/job: {{ $.Chart.Name }}-server
         prometheus.io/scrape: 'true'
         prometheus.io/port: '9090'
         {{- end }}
-        {{- include "temporal.resourceAnnotations" (list $ $service "pod") | nindent 8 }}
-      labels:
-        {{- include "temporal.resourceLabels" (list $ $service "pod") | nindent 8 }}
+        {{- with $.Values.server.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{ include "temporal.serviceAccount" $ }}
+      {{- if or $.Values.cassandra.enabled (or $.Values.elasticsearch.enabled $.Values.elasticsearch.external)}}
       {{- if semverCompare ">=1.13.0" $.Chart.AppVersion}}
       {{- with $.Values.server.securityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- end }}
-      {{- if or $.Values.cassandra.enabled (or $.Values.elasticsearch.enabled $.Values.elasticsearch.external)}}
       initContainers:
         {{- if $.Values.cassandra.enabled }}
         - name: check-cassandra-service
           image: busybox
-          command: ['sh', '-c', 'until nc -z {{ include "cassandra.host" $ }} {{ $.Values.cassandra.config.ports.cql }}; do echo waiting for cassandra service; sleep 1; done;']
+          command: ['sh', '-c', 'until nslookup {{ include "cassandra.host" $ }}; do echo waiting for cassandra service; sleep 1; done;']
         - name: check-cassandra
           image: "{{ $.Values.cassandra.image.repo }}:{{ $.Values.cassandra.image.tag }}"
           imagePullPolicy: {{ $.Values.cassandra.image.pullPolicy }}
@@ -50,18 +63,20 @@ spec:
           image: "{{ $.Values.cassandra.image.repo }}:{{ $.Values.cassandra.image.tag }}"
           imagePullPolicy: {{ $.Values.cassandra.image.pullPolicy }}
           command: ['sh', '-c', 'until cqlsh {{ include "cassandra.host" $ }} {{ $.Values.cassandra.config.ports.cql }} -e "SELECT keyspace_name FROM system_schema.keyspaces" | grep {{ $.Values.server.config.persistence.default.cassandra.keyspace }}$; do echo waiting for default keyspace to become ready; sleep 1; done;']
+        - name: check-cassandra-visibility-schema
+          image: "{{ $.Values.cassandra.image.repo }}:{{ $.Values.cassandra.image.tag }}"
+          imagePullPolicy: {{ $.Values.cassandra.image.pullPolicy }}
+          command: ['sh', '-c', 'until cqlsh {{ include "cassandra.host" $ }} {{ $.Values.cassandra.config.ports.cql }} -e "SELECT keyspace_name FROM system_schema.keyspaces" | grep {{ $.Values.server.config.persistence.visibility.cassandra.keyspace }}$; do echo waiting for visibility keyspace to become ready; sleep 1; done;']
         {{- end }}
         {{- if or $.Values.elasticsearch.enabled $.Values.elasticsearch.external }}
         - name: check-elasticsearch-index
           image: "{{ $.Values.admintools.image.repository }}:{{ $.Values.admintools.image.tag }}"
           imagePullPolicy: {{ $.Values.admintools.image.pullPolicy }}
-          command: ['sh', '-c', 'until curl --silent --fail --user "$ES_USER:$ES_PWD" $ES_SCHEME://$ES_HOST:$ES_PORT/$ES_VISIBILITY_INDEX 2>&1 > /dev/null; do echo waiting for elasticsearch index to become ready; sleep 1; done;']
-          env:
-            {{- include "temporal.admintools-env" (list $ "visibility") | nindent 12 }}
+          command: ['sh', '-c', 'until curl --silent --fail {{- if and $.Values.elasticsearch.username $.Values.elasticsearch.password }} --user {{ $.Values.elasticsearch.username }}:{{ $.Values.elasticsearch.password }} {{- end }} {{ $.Values.elasticsearch.scheme }}://{{ $.Values.elasticsearch.host }}:{{ $.Values.elasticsearch.port }}/{{ $.Values.elasticsearch.visibilityIndex }} 2>&1 > /dev/null; do echo waiting for elasticsearch index to become ready; sleep 1; done;']
         {{- end }}
       {{- end }}
       containers:
-        - name: {{ $.Chart.Name }}-{{ $service }}
+        - name: {{ $.Chart.Name }}-server
           image: "{{ $.Values.server.image.repository }}:{{ $.Values.server.image.tag }}"
           imagePullPolicy: {{ $.Values.server.image.pullPolicy }}
           env:
@@ -69,8 +84,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            - name: SERVICES
-              value: {{ $service }}
+            - name: ENABLE_ES
+              value: "{{ or $.Values.elasticsearch.enabled $.Values.elasticsearch.external }}"
+            - name: ES_SEEDS
+              value: "{{ $.Values.elasticsearch.host }}"
+            - name: ES_PORT
+              value: "{{ $.Values.elasticsearch.port }}"
+            - name: ES_VERSION
+              value: "{{ $.Values.elasticsearch.version }}"
+            - name: ES_SCHEME
+              value: "{{ $.Values.elasticsearch.scheme }}"
+            - name: ES_VIS_INDEX
+              value: "{{ $.Values.elasticsearch.visibilityIndex }}"
+            - name: ES_USER
+              value: "{{ $.Values.elasticsearch.username }}"
+            - name: ES_PWD
+              value: "{{ $.Values.elasticsearch.password }}"
             - name: TEMPORAL_STORE_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -85,29 +114,20 @@ spec:
             - name: TEMPORAL_VERSION_CHECK_DISABLED
               value: "1"
           {{- end }}
-          {{- if or $.Values.server.additionalEnv $serviceValues.additionalEnv }}
-          {{- toYaml (default $.Values.server.additionalEnv $serviceValues.additionalEnv) | nindent 12 }}
+          {{- if $.Values.server.additionalEnv }}
+          {{- toYaml $.Values.server.additionalEnv | nindent 12 }}
           {{- end }}
           ports:
-          {{- if ne $service "worker" }}
             - name: rpc
-              containerPort: {{ $serviceValues.service.port }}
+              containerPort: {{ include (printf "temporal.%s.grpcPort" "frontend") $ }}
               protocol: TCP
-          {{- end }}
-          {{- if eq $service "frontend" }}
-            - name: http
-              containerPort: {{ $serviceValues.service.httpPort }}
-              protocol: TCP
-          {{- end }}
             - name: metrics
               containerPort: 9090
               protocol: TCP
-          {{- if ne $service "worker" }}
           livenessProbe:
              initialDelaySeconds: 150
              tcpSocket:
                port: rpc
-          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/temporal/config/config_template.yaml
@@ -118,11 +138,7 @@ spec:
             {{- toYaml $.Values.server.additionalVolumeMounts | nindent 12}}
             {{- end }}
           resources:
-            {{- toYaml (default $.Values.server.resources $serviceValues.resources) | nindent 12 }}
-          {{- with $serviceValues.containerSecurityContext }}
-          securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- toYaml $.Values.server.resources | nindent 12 }}
         {{- if $.Values.server.sidecarContainers }}
         {{- toYaml $.Values.server.sidecarContainers | nindent 8 }}
         {{- end }}
@@ -133,7 +149,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: "{{ include "temporal.fullname" $ }}-config"
+            name: "{{ include "temporal.componentname" (list . "server") }}-config"
         - name: dynamic-config
           configMap:
             name: "{{ include "temporal.fullname" $ }}-dynamic-config"
@@ -143,22 +159,17 @@ spec:
         {{- if $.Values.server.additionalVolumes }}
         {{- toYaml $.Values.server.additionalVolumes | nindent 8}}
         {{- end }}
-      {{- with (default $.Values.server.nodeSelector $serviceValues.nodeSelector) }}
+      {{- with $.Values.server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-    {{- with (default $.Values.server.affinity $serviceValues.affinity) }}
+    {{- with $.Values.server.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
     {{- end }}
-    {{- with (default $.Values.server.tolerations $serviceValues.tolerations) }}
+    {{- with $.Values.server.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
     {{- end }}
-    {{- with $serviceValues.topologySpreadConstraints }}
-      topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
-    {{- end }}
 ---
-{{- end }}
 {{- end }}

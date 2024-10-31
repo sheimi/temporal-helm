@@ -1,4 +1,4 @@
-{{- if .Values.server.enabled -}}
+{{- if and $.Values.server.enabled (eq $.Values.server.mode "cluster")}}
 {{- $server := .Values.server -}}
 {{- $elasticsearch := .Values.elasticsearch -}}
 apiVersion: v1

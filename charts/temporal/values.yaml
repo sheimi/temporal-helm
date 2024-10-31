@@ -18,6 +18,7 @@ additionalAnnotations: {}
 additionalLabels: {}
 server:
   enabled: true
+  mode: 'standalone'  # 'standalone' or 'cluster'
   sidecarContainers: []
   image:
     repository: temporalio/server
